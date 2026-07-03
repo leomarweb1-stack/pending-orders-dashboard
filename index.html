@@ -124,6 +124,8 @@
   th.num, td.num{text-align:right;font-family:var(--mono);}
   td{padding:9px 10px;border-bottom:1px solid #F1F2F4;}
   tr:hover td{background:#FAFBFC;}
+  tr.total-row td{background:#F3F4F6;border-top:2px solid var(--line);border-bottom:2px solid var(--line);font-weight:700;color:var(--ink);}
+  tr.total-row:hover td{background:#F3F4F6;}
 
   .searchbar{display:flex;gap:10px;margin-bottom:14px;}
   .searchbar input{flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:var(--sans);background:#FAFBFC;}
@@ -341,6 +343,9 @@ const TAB_NAME = 'Raw Data';
 const TAB_GID = '39945118'; // exact tab ID, avoids ambiguity if multiple tabs share the name "Raw Data"
 // =========================================================================
 
+// Areas that get their own dedicated tab (Route/Chain summary + per-store detail).
+const AREA_CODES = ['A2','A3','A4','A5'];
+
 document.getElementById('tabNameRef').textContent = TAB_NAME;
 document.getElementById('tabNameFoot').textContent = TAB_NAME;
 
@@ -414,6 +419,11 @@ function fmtTime(d){
   return d.toLocaleString('en-US', {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'});
 }
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+// Converts a column letter (e.g. "P", "AD") to a 0-based column index.
+const letterToIndex = s => s.split('').reduce((acc,c)=> acc*26 + (c.charCodeAt(0)-64), 0) - 1;
+// Fixed column positions (per latest source-of-truth mapping), independent of header text.
+const SO_DATE_COL = letterToIndex('P');   // Sales Order Date
+const YOUR_REF_COL = letterToIndex('AD'); // Your Ref
 function fmtAsOf(raw){
   if(raw === undefined || raw === null || raw === '') return null;
   let d = null;
@@ -443,6 +453,33 @@ function toNum(v){
   return isNaN(n) ? 0 : n;
 }
 
+// Parses a raw gviz cell value (Date object, "Date(y,m,d)" string, or plain
+// string/number) into a JS Date, or null if it can't be parsed.
+function parseGvizValue(raw){
+  if(raw === undefined || raw === null || raw === '') return null;
+  if(raw instanceof Date) return isNaN(raw) ? null : raw;
+  if(typeof raw === 'string'){
+    const m = raw.match(/^Date\((\d+),(\d+),(\d+)/);
+    if(m) return new Date(+m[1], +m[2], +m[3]);
+    const parsed = new Date(raw);
+    return isNaN(parsed) ? null : parsed;
+  }
+  const parsed = new Date(raw);
+  return isNaN(parsed) ? null : parsed;
+}
+function fmtDateShort(d){
+  if(!d) return '';
+  const dd = String(d.getDate()).padStart(2,'0');
+  return `${MONTH_NAMES[d.getMonth()].slice(0,3)} ${dd}, ${d.getFullYear()}`;
+}
+// Age = today - Sales Order Date, in whole days.
+function daysSince(d){
+  if(!d) return null;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const dd = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return Math.round((today-dd)/86400000);
+}
+
 // ---------- FETCH + PARSE ----------
 async function loadData(){
   const loadingScreen = document.getElementById('loadingScreen');
@@ -469,7 +506,6 @@ async function loadData(){
       return rowText || colLabels[i] || '';
     });
     const headerNorm = header.map(norm);
-    const letterToIndex = s => s.split('').reduce((acc,c)=> acc*26 + (c.charCodeAt(0)-64), 0) - 1;
     // Google's export silently drops header text for these specific columns
     // (numeric/date columns whose label doesn't fit the inferred type).
     // Fall back to their known fixed positions in this sheet's layout.
@@ -529,6 +565,7 @@ function transform(rows, col){
   const soAll = new Set();
   const partialSOs = new Set(); // unique SOs (col O) tagged "Partial" in col N, for areas starting with A1-A5 -> MT Partially Served for Closing
   const closingAreaPrefixes = ['A1','A2','A3','A4','A5'];
+  const areaDetailMap = {}; // per-area (A2-A5) Route/Chain summary + per-store detail
 
   rows.forEach(r => {
     const area = g(r,'Area'), chain = g(r,'Chain'), store = g(r,'Customer Name'), age = g(r,'Age');
@@ -537,6 +574,10 @@ function transform(rows, col){
     const netInv = n(r,'Net Inventory'), totInv = n(r,'Total Inventory');
     const so = g(r,'SO Number');
     const partialTag = g(r,'Partial');
+    const route = g(r,'Route');
+    const yourRef = (r[YOUR_REF_COL] === undefined || r[YOUR_REF_COL] === null) ? '' : r[YOUR_REF_COL].toString().trim();
+    const soDate = parseGvizValue(r[SO_DATE_COL]);
+    const ageDays = daysSince(soDate); // Age = today - Sales Order Date
 
     if(!area) return;
 
@@ -552,6 +593,22 @@ function transform(rows, col){
 
     totalAmount += amt;
     totalVolume += vol;
+
+    // per-area (A2-A5) Route/Chain summary + per-SalesOrder detail
+    if(AREA_CODES.includes(areaCode)){
+      if(!areaDetailMap[areaCode]) areaDetailMap[areaCode] = {summaryMap:{}, soMap:{}};
+      const ad = areaDetailMap[areaCode];
+      const sKey = route + '||' + chain;
+      if(!ad.summaryMap[sKey]) ad.summaryMap[sKey] = {route, chain, amount:0, volume:0};
+      ad.summaryMap[sKey].amount += amt;
+      ad.summaryMap[sKey].volume += vol;
+
+      if(so){
+        if(!ad.soMap[so]) ad.soMap[so] = {so, route, chain, store, soDate: fmtDateShort(soDate), age: ageDays, yourRef, amount:0, volume:0};
+        ad.soMap[so].amount += amt;
+        ad.soMap[so].volume += vol;
+      }
+    }
 
     // item agg (dedupe on item code, net/total inventory assumed constant per item)
     if(itemCode){
@@ -604,6 +661,19 @@ function transform(rows, col){
   const uniqueChains = new Set(rows.map(r=>g(r,'Chain')).filter(Boolean));
   const uniqueStores = new Set(rows.map(r=>g(r,'Customer Name')).filter(Boolean));
 
+  const areaDetail = {};
+  AREA_CODES.forEach(code=>{
+    const obj = areaDetailMap[code];
+    if(!obj){ areaDetail[code] = {summary:[], details:[]}; return; }
+    const summary = Object.values(obj.summaryMap)
+      .map(s => ({...s, amount: round2(s.amount), volume: round2(s.volume)}))
+      .sort((a,b)=> a.route.localeCompare(b.route) || a.chain.localeCompare(b.chain));
+    const details = Object.values(obj.soMap)
+      .map(s => ({...s, amount: round2(s.amount), volume: round2(s.volume)}))
+      .sort((a,b)=> a.route.localeCompare(b.route) || a.store.localeCompare(b.store));
+    areaDetail[code] = {summary, details};
+  });
+
   return {
     summary:{
       total_amount: round2(totalAmount),
@@ -618,6 +688,7 @@ function transform(rows, col){
     area: areaList,
     neg_inventory: negList,
     aging_tree: treeList,
+    area_detail: areaDetail,
   };
 }
 function round2(n){ return Math.round(n*100)/100; }
@@ -629,6 +700,65 @@ const views = {
   neg: {title:'Negative Inventory', sub:'Items where pending orders exceed available stock'},
   aging: {title:'Aging Drilldown', sub:'How long pending orders have been open, by area, chain, and store'},
 };
+
+// ---------- A2–A5 AREA TABS (generated) ----------
+const AREA_LABELS = {A2:'Leyte', A3:'Panay', A4:'Negros', A5:'Bohol'};
+AREA_CODES.forEach(code=>{
+  views[code] = {title: AREA_LABELS[code], sub:`Route/chain summary and per-Sales-Order detail for ${AREA_LABELS[code]} (Area ${code}) only`};
+});
+
+(function buildAreaTabs(){
+  const mobileNav = document.getElementById('mobileTabs');
+  const sideNav = document.querySelector('.side');
+  const sideFoot = sideNav.querySelector('.side-foot');
+  const mainEl = document.querySelector('.main');
+
+  AREA_CODES.forEach((code, idx)=>{
+    const label = AREA_LABELS[code];
+
+    // top mobile tab
+    const mobileItem = document.createElement('div');
+    mobileItem.className = 'navitem';
+    mobileItem.dataset.view = code;
+    mobileItem.textContent = label;
+    mobileNav.appendChild(mobileItem);
+
+    // sidebar nav item
+    const sideItem = document.createElement('div');
+    sideItem.className = 'navitem';
+    sideItem.dataset.view = code;
+    sideItem.innerHTML = `<span class="num">0${5+idx}</span> ${label}`;
+    sideNav.insertBefore(sideItem, sideFoot);
+
+    // view section: Summary Per Route and Chain + Details Per Store (per Sales Order)
+    const section = document.createElement('div');
+    section.className = 'view';
+    section.id = `view-${code}`;
+    section.innerHTML = `
+      <section class="card">
+        <h3>Summary Per Route and Chain</h3>
+        <p class="desc">Pending amount &amp; volume grouped by Route and Chain — ${label} only. Sorted alphabetically by Route.</p>
+        <table id="areaDetailSummary-${code}">
+          <thead><tr>
+            <th>Route</th><th>Chain</th><th class="num">Amount</th><th class="num">Volume</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <h3>Details Per Store</h3>
+        <p class="desc">One row per Sales Order, showing total Pending Amount &amp; Pending Volume for that SO. Age = today − Sales Order Date. Sorted alphabetically by Route.</p>
+        <table id="areaDetailStores-${code}">
+          <thead><tr>
+            <th>Route</th><th>Customer Name</th><th>SO Number</th><th>Sales Order Date</th><th class="num">Age</th><th>Your Ref</th><th class="num">Amount</th><th class="num">Volume</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>`;
+    mainEl.appendChild(section);
+  });
+})();
+
 document.querySelectorAll('.navitem').forEach(el=>{
   el.addEventListener('click', ()=>{
     const v = el.dataset.view;
@@ -653,6 +783,51 @@ function renderAll(){
   document.querySelectorAll('.negBadge').forEach(b=> b.textContent = DATA.summary.neg_inventory_items);
   renderNegTable();
   renderAgingTree(document.getElementById('agingSearch').value || '');
+  AREA_CODES.forEach(renderAreaDetail);
+}
+
+function renderAreaDetail(code){
+  const d = (DATA.area_detail && DATA.area_detail[code]) || {summary:[], details:[]};
+  const label = AREA_LABELS[code] || code;
+
+  const sumBody = document.querySelector(`#areaDetailSummary-${code} tbody`);
+  if(sumBody){
+    if(d.summary.length){
+      const rowsHtml = d.summary.map(r => `
+      <tr>
+        <td>${r.route || '—'}</td>
+        <td>${r.chain || '—'}</td>
+        <td class="num">${fmtMoney(r.amount)}</td>
+        <td class="num">${fmtNum(r.volume)}</td>
+      </tr>`).join('');
+      const totalAmount = d.summary.reduce((s,r)=>s+r.amount,0);
+      const totalVolume = d.summary.reduce((s,r)=>s+r.volume,0);
+      const totalRow = `
+      <tr class="total-row">
+        <td colspan="2">Total</td>
+        <td class="num">${fmtMoney(round2(totalAmount))}</td>
+        <td class="num">${fmtNum(round2(totalVolume))}</td>
+      </tr>`;
+      sumBody.innerHTML = rowsHtml + totalRow;
+    } else {
+      sumBody.innerHTML = `<tr><td colspan="4"><div class="empty">No pending orders in ${label}.</div></td></tr>`;
+    }
+  }
+
+  const detBody = document.querySelector(`#areaDetailStores-${code} tbody`);
+  if(detBody){
+    detBody.innerHTML = d.details.length ? d.details.map(r => `
+      <tr>
+        <td>${r.route || '—'}</td>
+        <td>${r.store || '—'}</td>
+        <td>${r.so || '—'}</td>
+        <td>${r.soDate || '—'}</td>
+        <td class="num">${r.age===null||r.age===undefined ? '—' : r.age}</td>
+        <td>${r.yourRef || ''}</td>
+        <td class="num">${fmtMoney(r.amount)}</td>
+        <td class="num">${fmtNum(r.volume)}</td>
+      </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No stores in ${label}.</div></td></tr>`;
+  }
 }
 
 function renderKpis(){
