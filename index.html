@@ -218,7 +218,7 @@
 <div id="mobileTabs" class="mobile-tabs">
   <div class="navitem active" data-view="overview">Overview</div>
   <div class="navitem" data-view="area">Per Area</div>
-  <div class="navitem" data-view="neg">Negative <span class="badge negBadge">0</span></div>
+  <div class="navitem" data-view="neg">Inventory <span class="badge negBadge">0</span></div>
   <div class="navitem" data-view="aging">Aging</div>
 </div>
 
@@ -249,7 +249,7 @@
     </div>
     <div class="navitem active" data-view="overview"><span class="num">01</span> Overview</div>
     <div class="navitem" data-view="area"><span class="num">02</span> Per Area</div>
-    <div class="navitem" data-view="neg"><span class="num">03</span> Negative Inventory <span class="badge negBadge" id="negBadge">0</span></div>
+    <div class="navitem" data-view="neg"><span class="num">03</span> Inventory <span class="badge negBadge" id="negBadge">0</span></div>
     <div class="navitem" data-view="aging"><span class="num">04</span> Aging Drilldown</div>
     <div class="side-foot">Source: Google Sheets (live)<br>Tab: <span id="tabNameFoot"></span></div>
   </div>
@@ -269,9 +269,24 @@
     <div class="view active" id="view-overview">
       <div class="kpis" id="kpiRow"></div>
       <section class="card">
-        <h3>Top areas by pending amount</h3>
-        <p class="desc">Where the peso value of unfulfilled orders is concentrated right now.</p>
-        <div id="overviewBars"></div>
+        <h3>Pending Per Area</h3>
+        <p class="desc">Pending Amount &amp; Volume by Area, company-wide. Sorted alphabetically by Area.</p>
+        <table id="pendingPerAreaTable">
+          <thead><tr>
+            <th>Area</th><th class="num">Amount</th><th class="num">Volume</th><th class="num">No. of 10W</th><th>Remarks</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <h3>Offshore Pending Per Area</h3>
+        <p class="desc">Pending Amount &amp; Volume by Route, across offshore areas (Leyte, Panay, Negros, Bohol). Sorted alphabetically by Route.</p>
+        <table id="offshoreRouteTable">
+          <thead><tr>
+            <th>Route</th><th class="num">Amount</th><th class="num">Volume</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </section>
       <section class="card">
         <h3>Most urgent — 10D+ aged pending amount by area</h3>
@@ -309,7 +324,9 @@
             <th data-key="net_inventory" class="num">Net Inventory</th>
             <th data-key="total_inventory" class="num">On Hand</th>
             <th data-key="pending_balance" class="num">Pending Qty</th>
-            <th data-key="pending_amount" class="num">Pending Amount</th>
+            <th data-key="mt" class="num">MT</th>
+            <th data-key="gt" class="num">GT</th>
+            <th data-key="other" class="num">Other</th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -424,6 +441,8 @@ const letterToIndex = s => s.split('').reduce((acc,c)=> acc*26 + (c.charCodeAt(0
 // Fixed column positions (per latest source-of-truth mapping), independent of header text.
 const SO_DATE_COL = letterToIndex('P');   // Sales Order Date
 const YOUR_REF_COL = letterToIndex('AD'); // Your Ref
+const PENDING_QTY_COL = letterToIndex('X'); // PENDING BALANCE — used for "Pending Quantity" in the Inventory tab
+const TYPE_CATEGORY_COL = letterToIndex('AK'); // Category used to bucket Pending Qty: "01 GT" -> GT, "02 MT" -> MT, else Other
 function fmtAsOf(raw){
   if(raw === undefined || raw === null || raw === '') return null;
   let d = null;
@@ -566,6 +585,7 @@ function transform(rows, col){
   const partialSOs = new Set(); // unique SOs (col O) tagged "Partial" in col N, for areas starting with A1-A5 -> MT Partially Served for Closing
   const closingAreaPrefixes = ['A1','A2','A3','A4','A5'];
   const areaDetailMap = {}; // per-area (A2-A5) Route/Chain summary + per-store detail
+  const offshoreRouteMap = {}; // Route-level Amount/Volume totals across offshore areas (A2-A5), for the Overview tab
 
   rows.forEach(r => {
     const area = g(r,'Area'), chain = g(r,'Chain'), store = g(r,'Customer Name'), age = g(r,'Age');
@@ -608,13 +628,26 @@ function transform(rows, col){
         ad.soMap[so].amount += amt;
         ad.soMap[so].volume += vol;
       }
+
+      // Overview: Route-level Amount (PENDINGAMOUNT) / Volume (PENDING BALANCE) across offshore areas
+      if(!offshoreRouteMap[route]) offshoreRouteMap[route] = {route, amount:0, volume:0};
+      offshoreRouteMap[route].amount += amt;
+      offshoreRouteMap[route].volume += vol;
     }
 
     // item agg (dedupe on item code, net/total inventory assumed constant per item)
     if(itemCode){
-      if(!itemMap[itemCode]) itemMap[itemCode] = {item_code:itemCode, item:itemDesc, net_inventory:netInv, total_inventory:totInv, pending_balance:0, pending_amount:0};
-      itemMap[itemCode].pending_balance += vol;
-      itemMap[itemCode].pending_amount += amt;
+      const pendingQty = toNum(r[PENDING_QTY_COL]);
+      const rawCat = (r[TYPE_CATEGORY_COL] === undefined || r[TYPE_CATEGORY_COL] === null) ? '' : r[TYPE_CATEGORY_COL].toString().trim().toUpperCase();
+      if(!itemMap[itemCode]) itemMap[itemCode] = {item_code:itemCode, item:itemDesc, net_inventory:netInv, total_inventory:totInv, pending_balance:0, mt:0, gt:0, other:0};
+      itemMap[itemCode].pending_balance += pendingQty;
+      if(rawCat.includes('02 MT') || rawCat === 'MT'){
+        itemMap[itemCode].mt += pendingQty;
+      }else if(rawCat.includes('01 GT') || rawCat === 'GT'){
+        itemMap[itemCode].gt += pendingQty;
+      }else{
+        itemMap[itemCode].other += pendingQty;
+      }
     }
 
     // aging tree
@@ -630,7 +663,7 @@ function transform(rows, col){
     .sort((a,b)=>b.amount-a.amount);
 
   const negList = Object.values(itemMap).filter(i => i.net_inventory < 0)
-    .map(i => ({...i, net_inventory:round2(i.net_inventory), total_inventory:round2(i.total_inventory), pending_balance:round2(i.pending_balance), pending_amount:round2(i.pending_amount)}))
+    .map(i => ({...i, net_inventory:round2(i.net_inventory), total_inventory:round2(i.total_inventory), pending_balance:round2(i.pending_balance), mt:round2(i.mt), gt:round2(i.gt), other:round2(i.other)}))
     .sort((a,b)=>a.net_inventory-b.net_inventory);
 
   const ageOrder = ['1-5D','6-10D','10D+'];
@@ -661,17 +694,24 @@ function transform(rows, col){
   const uniqueChains = new Set(rows.map(r=>g(r,'Chain')).filter(Boolean));
   const uniqueStores = new Set(rows.map(r=>g(r,'Customer Name')).filter(Boolean));
 
+  const offshoreRoutes = Object.values(offshoreRouteMap)
+    .map(r => ({...r, amount: round2(r.amount), volume: round2(r.volume)}))
+    .sort((a,b)=> (a.route||'').localeCompare(b.route||''));
+
   const areaDetail = {};
   AREA_CODES.forEach(code=>{
     const obj = areaDetailMap[code];
-    if(!obj){ areaDetail[code] = {summary:[], details:[]}; return; }
+    if(!obj){ areaDetail[code] = {summary:[], details:[], detailsByChain:[]}; return; }
     const summary = Object.values(obj.summaryMap)
       .map(s => ({...s, amount: round2(s.amount), volume: round2(s.volume)}))
       .sort((a,b)=> a.route.localeCompare(b.route) || a.chain.localeCompare(b.chain));
     const details = Object.values(obj.soMap)
       .map(s => ({...s, amount: round2(s.amount), volume: round2(s.volume)}))
       .sort((a,b)=> a.route.localeCompare(b.route) || a.store.localeCompare(b.store));
-    areaDetail[code] = {summary, details};
+    const detailsByChain = Object.values(obj.soMap)
+      .map(s => ({...s, amount: round2(s.amount), volume: round2(s.volume)}))
+      .sort((a,b)=> (a.chain||'').localeCompare(b.chain||'') || (a.store||'').localeCompare(b.store||''));
+    areaDetail[code] = {summary, details, detailsByChain};
   });
 
   return {
@@ -689,6 +729,7 @@ function transform(rows, col){
     neg_inventory: negList,
     aging_tree: treeList,
     area_detail: areaDetail,
+    offshore_route: offshoreRoutes,
   };
 }
 function round2(n){ return Math.round(n*100)/100; }
@@ -697,7 +738,7 @@ function round2(n){ return Math.round(n*100)/100; }
 const views = {
   overview: {title:'Overview', sub:'Company-wide pending order health'},
   area: {title:'Per Area', sub:'Pending volume and amount broken down by area'},
-  neg: {title:'Negative Inventory', sub:'Items where pending orders exceed available stock'},
+  neg: {title:'Inventory', sub:'Items where pending orders exceed available stock'},
   aging: {title:'Aging Drilldown', sub:'How long pending orders have been open, by area, chain, and store'},
 };
 
@@ -754,6 +795,16 @@ AREA_CODES.forEach(code=>{
           </tr></thead>
           <tbody></tbody>
         </table>
+      </section>
+      <section class="card">
+        <h3>SO Ageing Per Chain and Store</h3>
+        <p class="desc">One row per Sales Order, showing total Pending Amount &amp; Pending Volume for that SO. Age = today − Sales Order Date. Sorted alphabetically by Chain.</p>
+        <table id="areaDetailChain-${code}">
+          <thead><tr>
+            <th>Chain</th><th>Customer Name</th><th>SO Number</th><th>Sales Order Date</th><th class="num">Age</th><th>Your Ref</th><th class="num">Amount</th><th class="num">Volume</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </section>`;
     mainEl.appendChild(section);
   });
@@ -777,7 +828,8 @@ function renderAll(){
   document.getElementById('asOfLabel').textContent = asOfText;
   document.getElementById('asOfChip').textContent = asOfText;
   renderKpis();
-  renderBarList(document.getElementById('overviewBars'), DATA.area, 'amount', 'area', 8);
+  renderPendingPerAreaTable();
+  renderOffshoreRouteTable();
   renderBarList(document.getElementById('urgentBars'), computeUrgent(), 'amount', 'area', 8);
   renderAreaTable();
   document.querySelectorAll('.negBadge').forEach(b=> b.textContent = DATA.summary.neg_inventory_items);
@@ -828,6 +880,92 @@ function renderAreaDetail(code){
         <td class="num">${fmtNum(r.volume)}</td>
       </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No stores in ${label}.</div></td></tr>`;
   }
+
+  const chainBody = document.querySelector(`#areaDetailChain-${code} tbody`);
+  if(chainBody){
+    const rows = d.detailsByChain || [];
+    chainBody.innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td>${r.chain || '—'}</td>
+        <td>${r.store || '—'}</td>
+        <td>${r.so || '—'}</td>
+        <td>${r.soDate || '—'}</td>
+        <td class="num">${r.age===null||r.age===undefined ? '—' : r.age}</td>
+        <td>${r.yourRef || ''}</td>
+        <td class="num">${fmtMoney(r.amount)}</td>
+        <td class="num">${fmtNum(r.volume)}</td>
+      </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No stores in ${label}.</div></td></tr>`;
+  }
+}
+
+function computeRemarks(area, no10w){
+  const firstLetter = (area || '').trim().toUpperCase().charAt(0);
+  if(firstLetter !== 'B' && firstLetter !== 'C') return '';
+  const roundedUp = Math.ceil(no10w);
+  const diff = roundedUp - no10w;
+  if(diff <= 0) return '';
+  const xx = Math.ceil(diff / 0.04576934437);
+  const xxy = xx * 56;
+  if(xxy > 600) return '';
+  return `Add ${xxy} bags of SCG55g`;
+}
+
+function renderPendingPerAreaTable(){
+  const rows = [...(DATA.area || [])].sort((a,b)=> (a.area||'').localeCompare(b.area||''));
+  const tb = document.querySelector('#pendingPerAreaTable tbody');
+  if(!tb) return;
+  if(rows.length===0){
+    tb.innerHTML = `<tr><td colspan="5"><div class="empty">No pending orders.</div></td></tr>`;
+    return;
+  }
+  const rowsHtml = rows.map(r => {
+    const no10w = r.volume / 54;
+    const remarks = computeRemarks(r.area, no10w);
+    return `
+    <tr>
+      <td>${r.area || '—'}</td>
+      <td class="num">${fmtMoney(r.amount)}</td>
+      <td class="num">${fmtNum(r.volume)}</td>
+      <td class="num">${fmtNum(no10w)}</td>
+      <td>${remarks}</td>
+    </tr>`;
+  }).join('');
+  const totalAmount = rows.reduce((s,r)=>s+r.amount,0);
+  const totalVolume = rows.reduce((s,r)=>s+r.volume,0);
+  const totalRow = `
+    <tr class="total-row">
+      <td>Total</td>
+      <td class="num">${fmtMoney(round2(totalAmount))}</td>
+      <td class="num">${fmtNum(round2(totalVolume))}</td>
+      <td class="num">${fmtNum(round2(totalVolume/54))}</td>
+      <td></td>
+    </tr>`;
+  tb.innerHTML = rowsHtml + totalRow;
+}
+
+function renderOffshoreRouteTable(){
+  const rows = DATA.offshore_route || [];
+  const tb = document.querySelector('#offshoreRouteTable tbody');
+  if(!tb) return;
+  if(rows.length===0){
+    tb.innerHTML = `<tr><td colspan="3"><div class="empty">No offshore pending orders.</div></td></tr>`;
+    return;
+  }
+  const rowsHtml = rows.map(r => `
+    <tr>
+      <td>${r.route || '—'}</td>
+      <td class="num">${fmtMoney(r.amount)}</td>
+      <td class="num">${fmtNum(r.volume)}</td>
+    </tr>`).join('');
+  const totalAmount = rows.reduce((s,r)=>s+r.amount,0);
+  const totalVolume = rows.reduce((s,r)=>s+r.volume,0);
+  const totalRow = `
+    <tr class="total-row">
+      <td>Total</td>
+      <td class="num">${fmtMoney(round2(totalAmount))}</td>
+      <td class="num">${fmtNum(round2(totalVolume))}</td>
+    </tr>`;
+  tb.innerHTML = rowsHtml + totalRow;
 }
 
 function renderKpis(){
@@ -897,16 +1035,18 @@ function renderNegTable(){
   rows = rows.sort((a,b)=> (a[negSort.key]>b[negSort.key]?1:-1) * negSort.dir);
   const tb = document.querySelector('#negTable tbody');
   if(rows.length===0){
-    tb.innerHTML = `<tr><td colspan="5"><div class="empty">No items match your search.</div></td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7"><div class="empty">No items match your search.</div></td></tr>`;
     return;
   }
   tb.innerHTML = rows.map(r => `
     <tr>
-      <td>${r.item}<div class="foot-note">${r.item_code}</div></td>
+      <td>${r.item}</td>
       <td class="num neg-badge">${fmtNum(r.net_inventory)}</td>
       <td class="num">${fmtNum(r.total_inventory)}</td>
       <td class="num">${fmtNum(r.pending_balance)}</td>
-      <td class="num">${fmtMoney(r.pending_amount)}</td>
+      <td class="num">${fmtNum(r.mt)}</td>
+      <td class="num">${fmtNum(r.gt)}</td>
+      <td class="num">${fmtNum(r.other)}</td>
     </tr>`).join('');
 }
 document.querySelectorAll('#negTable th').forEach(th => {
